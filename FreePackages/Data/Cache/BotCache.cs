@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
 using ArchiSteamFarm.Collections;
 using ArchiSteamFarm.Core;
@@ -50,8 +51,32 @@ namespace FreePackages {
 		private HashSet<uint> SeenPackageIDActivations = new();
 		private readonly object LockObject = new();
 
+		// Debounced save: a burst of mutations collapses into a single deferred write.
+		// SerializableFile already coalesces concurrent saves (SavingScheduled flag), but
+		// replacing Utilities.InBackground(Save) — which allocates a threadpool task per
+		// mutation — with a one-shot timer re-arm avoids tens of thousands of task
+		// allocations under a large PICS changelist. ASF exposes no shutdown hook for
+		// IBotModules, so a final flush on process exit is not possible from the plugin;
+		// worst case is losing mutations made in the last SaveDebounceDelay before an
+		// abrupt exit.
+		private Timer? SaveTimer;
+		private static readonly TimeSpan SaveDebounceDelay = TimeSpan.FromSeconds(5);
+
 		[JsonConstructor]
-		internal BotCache() { }
+		internal BotCache() {
+			SaveTimer = new Timer(
+				async _ => {
+					try {
+						await Save().ConfigureAwait(false);
+					} catch (Exception e) {
+						ASF.ArchiLogger.LogGenericException(e);
+					}
+				},
+				null,
+				Timeout.Infinite,
+				Timeout.Infinite
+			);
+		}
 
 		internal BotCache(string filePath) : this() {
 			if (string.IsNullOrEmpty(filePath)) {
@@ -62,6 +87,17 @@ namespace FreePackages {
 		}
 
 		protected override Task Save() => Save(this);
+
+		private void ScheduleSave() => SaveTimer?.Change(SaveDebounceDelay, Timeout.InfiniteTimeSpan);
+
+		protected override void Dispose(bool disposing) {
+			if (disposing) {
+				SaveTimer?.Dispose();
+				SaveTimer = null;
+			}
+
+			base.Dispose(disposing);
+		}
 
 		internal static async Task<BotCache?> CreateOrLoad(string filePath) {
 			if (string.IsNullOrEmpty(filePath)) {
@@ -107,7 +143,7 @@ namespace FreePackages {
 			}
 
 			Packages.Add(package);
-			Utilities.InBackground(Save);
+			ScheduleSave();
 
 			return true;
 		}
@@ -119,21 +155,21 @@ namespace FreePackages {
 			}
 
 			Packages.UnionWith(packages);
-			Utilities.InBackground(Save);
+			ScheduleSave();
 
 			return true;
 		}
 
 		internal bool RemovePackage(Package package) {
 			Packages.Remove(package);
-			Utilities.InBackground(Save);
+			ScheduleSave();
 
 			return true;
 		}
 
 		internal bool RemoveAppPackages(HashSet<uint> appIDsToRemove) {
 			Packages.Where(x => x.Type == EPackageType.App && appIDsToRemove.Contains(x.ID)).ToList().ForEach(x => Packages.Remove(x));
-			Utilities.InBackground(Save);
+			ScheduleSave();
 
 			return true;
 		}
@@ -168,7 +204,7 @@ namespace FreePackages {
 				}
 			}
 
-			Utilities.InBackground(Save);
+			ScheduleSave();
 		}
 
 		internal int NumActivationsPastPeriod() {
@@ -204,7 +240,7 @@ namespace FreePackages {
 				NewOwnedPackages.UnionWith(newOwnedPackageIDs);
 			}
 
-			Utilities.InBackground(Save);
+			ScheduleSave();
 		}
 
 		internal void RemoveChange(uint? appID = null, uint? packageID = null, uint? newOwnedPackageID = null) {
@@ -222,25 +258,25 @@ namespace FreePackages {
 		}
 
 		internal void SaveChanges() {
-			Utilities.InBackground(Save);
+			ScheduleSave();
 		}
 
 		internal void ClearQueue() {
 			Packages.RemoveWhere(package => ActivationQueue.ActivationTypes.Contains(package.Type));
 			ChangedApps.Clear();
 			ChangedPackages.Clear();
-			Utilities.InBackground(Save);
+			ScheduleSave();
 		}
 
 		internal void CancelRemoval() {
 			Packages.RemoveWhere(package => RemovalQueue.RemovalTypes.Contains(package.Type));
-			Utilities.InBackground(Save);
+			ScheduleSave();
 		}
 
 		internal void AddWaitlistedPlaytest(uint appID) {
 			WaitlistedPlaytests.Add(appID);
 			
-			Utilities.InBackground(Save);
+			ScheduleSave();
 		}
 
 		internal void UpdateSeenPackages(List<SteamApps.LicenseListCallback.License> newLicenses) {
@@ -248,32 +284,43 @@ namespace FreePackages {
 
 			// Keep track of how many free licenses we activated to enforce the free packages limit
 			// This is to catch packages that were activated, but didn't return a success status, or were activated outside of the plugin
-			/* NOTE: The below code will not capture all recent activations.  If Steam removes a demo from your account, but you add it back, 
+			/* NOTE: The below code will not capture all recent activations.  If Steam removes a demo from your account, but you add it back,
 			 then the package will re-appear with the original TimeCreated value. Activations like these are instead logged when steam reports a
 			 successful activation.
 			 */
-			// TODO: Do other PaymentMethod values also count against the free package limit?
+			// Count clearly-free license types against the free package limit:
+			//   - Complimentary (1024): gifted/free grant from Steam
+			//   - AutoGrant (64): automatically granted (e.g. free-on-demand activations)
+			// Deliberately excluded:
+			//   - GuestPass (8): temporary, does not consume a permanent activation slot
+			//   - ActivationCode (1): redeemed via key, tracked separately
+			//   - Promotional (131): uncertain semantics; left out to avoid over-counting
 			foreach(SteamApps.LicenseListCallback.License license in newLicenses) {
-				if (license.PaymentMethod == EPaymentMethod.Complimentary &&
+				if (CountsAsFreeActivation(license.PaymentMethod) &&
 					license.TimeCreated.ToLocalTime() > DateTime.Now.AddMinutes(-1 * ActivationQueue.ActivationPeriodMinutes)
 				) {
 					AddActivation(license.TimeCreated.ToLocalTime(), packageIDs: [ license.PackageID ]);
 				}
 			}
 
-			Utilities.InBackground(Save);
+			ScheduleSave();
 		}
 
 		internal void IgnoreApp(uint appID) {
 			IgnoredApps.Add(appID);
 
-			Utilities.InBackground(Save);
+			ScheduleSave();
 		}
 
 		internal void UpdateASFInfoItemCount(uint currentASFInfoItemCount) {
 			LastASFInfoItemCount = currentASFInfoItemCount;
 
-			Utilities.InBackground(Save);
+			ScheduleSave();
 		}
+
+		// Whether a license's PaymentMethod counts as a free activation against the
+		// free-package limit. See UpdateSeenPackages for the rationale of what's included.
+		private static bool CountsAsFreeActivation(EPaymentMethod paymentMethod) =>
+			paymentMethod == EPaymentMethod.Complimentary || paymentMethod == EPaymentMethod.AutoGrant;
 	}
 }

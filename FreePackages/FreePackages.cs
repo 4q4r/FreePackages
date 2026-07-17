@@ -131,7 +131,9 @@ namespace FreePackages {
 		}
 
 		public Task OnBotDisconnected(Bot bot, EResult reason) {
-			return Task.FromResult(0);
+			PackageHandler.OnBotDisconnected(bot);
+
+			return Task.CompletedTask;
 		}
 	}
 }
