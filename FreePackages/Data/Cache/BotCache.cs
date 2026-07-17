@@ -41,6 +41,14 @@ namespace FreePackages {
 		[JsonDisallowNull]
 		internal ConcurrentHashSet<uint> WaitlistedPlaytests { get; private set; } = new();
 
+		// BASE appIDs of playtests we've already POSTed /ajaxrequestplaytestaccess for in
+		// the current catalog-membership epoch. Suppresses re-requests while the playtest
+		// stays live; pruned (along with WaitlistedPlaytests) when a playtest leaves the
+		// catalog so a re-opening is caught. See PlaytestCatalog.
+		[JsonInclude]
+		[JsonDisallowNull]
+		internal ConcurrentHashSet<uint> RequestedPlaytests { get; private set; } = new();
+
 		[JsonInclude]
 		[JsonDisallowNull]
 		internal ConcurrentHashSet<uint> IgnoredApps { get; private set; } = new();
@@ -275,7 +283,33 @@ namespace FreePackages {
 
 		internal void AddWaitlistedPlaytest(uint appID) {
 			WaitlistedPlaytests.Add(appID);
-			
+
+			ScheduleSave();
+		}
+
+		internal void AddRequestedPlaytest(uint appID) {
+			RequestedPlaytests.Add(appID);
+
+			ScheduleSave();
+		}
+
+		// Drop playtests that are no longer in the live catalog. Called only on a
+		// successful, complete catalog fetch (see PlaytestCatalog.DoUpdate) — never on a
+		// failed or partial one, so a network blip or markup change can't wipe the
+		// suppression sets and re-request the whole catalog. A playtest that re-opens
+		// later re-enters the catalog, gets pruned out of these sets on the cycle where it
+		// was absent, and is requested again on the cycle where it returns.
+		internal void PrunePlaytests(HashSet<uint> liveSet) {
+			ArgumentNullException.ThrowIfNull(liveSet);
+
+			if (RequestedPlaytests.Count > 0) {
+				RequestedPlaytests.RemoveWhere(id => !liveSet.Contains(id));
+			}
+
+			if (WaitlistedPlaytests.Count > 0) {
+				WaitlistedPlaytests.RemoveWhere(id => !liveSet.Contains(id));
+			}
+
 			ScheduleSave();
 		}
 

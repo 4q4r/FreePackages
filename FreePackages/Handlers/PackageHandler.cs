@@ -100,6 +100,50 @@ namespace FreePackages {
 			handler.RemovalCancellation?.Cancel();
 		}
 
+		// Called by PlaytestCatalog after every successful, complete fetch. Prunes the
+		// suppression sets of every connected, ready bot against the new live set, then
+		// proactively enqueues any live playtest the bot hasn't already requested or
+		// waitlisted. This catches playtests PICS never surfaced (the original discovery
+		// gap) without re-requesting ones already handled this epoch.
+		//
+		// The proactive path intentionally does NOT apply the limited/unlimited
+		// PlaytestMode filter: the catalog only gives us BASE appIDs, and resolving each
+		// one's playtest_type would cost an extra PICS fetch per playtest. The PICS path
+		// (HandlePlaytest) still applies that filter for playtests it discovers. Missing
+		// a re-opening is worse than occasionally enqueuing a limited playtest a
+		// unlimited-only bot didn't strictly want.
+		internal static void OnPlaytestCatalogUpdated(HashSet<uint> liveSet) {
+			ArgumentNullException.ThrowIfNull(liveSet);
+
+			if (liveSet.Count == 0 || Handlers.Count == 0) {
+				return;
+			}
+
+			foreach (PackageHandler handler in Handlers.Values) {
+				if (!handler.Bot.IsConnectedAndLoggedOn || !handler.PackageFilter.Ready) {
+					// Offline / not-yet-ready bots are skipped; they'll be caught on the next
+					// cycle once they're connected and their filter is populated.
+					continue;
+				}
+
+				handler.BotCache.PrunePlaytests(liveSet);
+
+				bool wantsPlaytests = handler.PackageFilter.FilterConfigs.Any(static filter => filter.PlaytestMode != EPlaytestMode.None);
+				if (!wantsPlaytests) {
+					continue;
+				}
+
+				int filterHash = handler.PackageFilter.Hash;
+				foreach (uint baseAppID in liveSet) {
+					if (handler.BotCache.RequestedPlaytests.Contains(baseAppID) || handler.BotCache.WaitlistedPlaytests.Contains(baseAppID)) {
+						continue;
+					}
+
+					handler.BotCache.AddPackage(new Package(EPackageType.Playtest, baseAppID, filterHash: filterHash));
+				}
+			}
+		}
+
 		private void UpdateUserData() {
 			UserDataRefreshTimer.Change(TimeSpan.Zero, TimeSpan.FromMinutes(15));
 		}
@@ -225,6 +269,9 @@ namespace FreePackages {
 					apps.ForEach(app => {
 						if (app.Type == EAppType.Beta) {
 							Handlers.Values.ToList().ForEach(x => x.HandlePlaytest(app));
+							// A Beta-app change may be the first sign a playtest just opened; wake the
+							// catalog (debounced) so the live set reflects it within a minute.
+							PlaytestCatalog.RequestRefresh();
 						} else {
 							Handlers.Values.ToList().ForEach(x => x.HandleFreeApp(app));
 						}
@@ -339,6 +386,15 @@ namespace FreePackages {
 
 			try {
 				if (app.Parent == null) {
+					return;
+				}
+
+				// Once the catalog has fetched at least once, gate strictly on the live
+				// set: a Beta-app PICS change for a playtest whose signup isn't currently
+				// open must not produce a POST. Before the first successful fetch the live
+				// set is empty, so we fall back to the original PICS-only behaviour rather
+				// than killing every playtest on a fresh start.
+				if (PlaytestCatalog.HasFetched && !PlaytestCatalog.IsLive(app.Parent.ID)) {
 					return;
 				}
 
