@@ -37,6 +37,7 @@ namespace FreePackages {
 		public void Dispose() {
 			ActivationQueue.Dispose();
 			UserDataRefreshTimer.Dispose();
+			BotCache.Dispose();
 		}
 
 		internal static async Task AddHandler(Bot bot, List<FilterConfig> filterConfigs, uint? packageLimit, bool pauseWhilePlaying, bool pauseWhileFarming) {
@@ -87,6 +88,18 @@ namespace FreePackages {
 			Handlers[bot.BotName].RemovalQueue.Start();
 		}
 
+		internal static void OnBotDisconnected(Bot bot) {
+			if (!Handlers.TryGetValue(bot.BotName, out PackageHandler? handler)) {
+				return;
+			}
+
+			// Cancel any in-flight ScanRemovables for this bot so a disconnect doesn't
+			// leave it blocked on ProcessChangesSemaphore / product info fetches. The
+			// activation/removal queues self-pause via Bot.IsConnectedAndLoggedOn and
+			// resume on their own timers on reconnect — no need to touch them here.
+			handler.RemovalCancellation?.Cancel();
+		}
+
 		private void UpdateUserData() {
 			UserDataRefreshTimer.Change(TimeSpan.Zero, TimeSpan.FromMinutes(15));
 		}
@@ -134,12 +147,25 @@ namespace FreePackages {
 			Utilities.InBackground(async() => await HandleChanges().ConfigureAwait(false));
 		}
 
-		private async static Task<bool> IsReady(uint maxWaitTimeSeconds = 120) {
+		// Waits for every enabled bot's PackageFilter to be ready before processing a
+		// changelist. The return value is intentionally ignored by HandleChanges: a
+		// non-ready bot early-returns inside HandleFreeApp/HandleFreePackage (before its
+		// RemoveChange finally block), so its changes stay in ChangedApps/ChangedPackages
+		// and are retried on the next cycle. We therefore cap the wait at a short bound
+		// (default 15 s) rather than blocking the whole batch for one stuck bot, and log
+		// when we give up so the operator can see which bot is lagging.
+		private async static Task<bool> IsReady(uint maxWaitTimeSeconds = 15) {
 			DateTime timeoutTime = DateTime.Now.AddSeconds(maxWaitTimeSeconds);
 			do {
-				bool ready = Handlers.Values.Where(x => x.Bot.BotConfig.Enabled && !x.PackageFilter.Ready).Count() == 0;
-				if (ready) {
+				IReadOnlyCollection<PackageHandler> notReady = Handlers.Values.Where(x => x.Bot.BotConfig.Enabled && !x.PackageFilter.Ready).ToList();
+				if (notReady.Count == 0) {
 					return true;
+				}
+
+				if (maxWaitTimeSeconds > 0 && DateTime.Now >= timeoutTime) {
+					ASF.ArchiLogger.LogGenericWarning($"IsReady timed out after {maxWaitTimeSeconds}s; {notReady.Count}/{Handlers.Values.Count(x => x.Bot.BotConfig.Enabled)} bot(s) not ready: {String.Join(", ", notReady.Select(x => x.Bot.BotName))}. Proceeding anyway — their changes will be retried.");
+
+					return false;
 				}
 
 				await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
@@ -190,7 +216,7 @@ namespace FreePackages {
 				).ConfigureAwait(false);
 
 				if (apps == null) {
-					ASF.ArchiLogger.LogGenericError(Strings.ProductInfoFetchFailed);
+					ASF.ArchiLogger.LogGenericError($"{Strings.ProductInfoFetchFailed} (while extracting apps from {productInfos.Count} product info callback(s))");
 
 					return;
 				}
@@ -218,7 +244,7 @@ namespace FreePackages {
 				).ConfigureAwait(false);
 
 				if (packages == null) {
-					ASF.ArchiLogger.LogGenericError(Strings.ProductInfoFetchFailed);
+					ASF.ArchiLogger.LogGenericError($"{Strings.ProductInfoFetchFailed} (while extracting packages from {productInfos.Count} product info callback(s))");
 
 					return;
 				}
