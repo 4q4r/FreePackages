@@ -89,6 +89,56 @@ public class PlaytestCatalogTests {
 		Assert.AreEqual(0, botCache.WaitlistedPlaytests.Count);
 	}
 
+	// IsUnconstrainedAllPlaytestsFilter gates the proactive catalog path: it must be
+	// true only for a filter that accepts every playtest (PlaytestMode All, nothing else
+	// set), so the catalog path — which has only BASE appIDs and can't honor any finer
+	// filter — never bypasses the user's filters. Any constraint falls back to the PICS
+	// path (HandlePlaytest), which resolves metadata and applies the filter first.
+	[TestMethod]
+	public void IsUnconstrainedAllPlaytestsFilterAcceptsAllOnlyConfig() {
+		// A filter with only PlaytestMode = All. IgnoredTypes defaults to {"Demo"}, which
+		// never rejects a playtest (playtests are not demos), so the default is allowed.
+		Assert.IsTrue(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All }));
+
+		// An empty IgnoredTypes is allowed too.
+		Assert.IsTrue(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, IgnoredTypes = new HashSet<string>() }));
+	}
+
+	[TestMethod]
+	public void IsUnconstrainedAllPlaytestsFilterRejectsPlaytestModeOtherThanAll() {
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.None }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.Unlimited }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.Limited }));
+	}
+
+	[TestMethod]
+	public void IsUnconstrainedAllPlaytestsFilterRejectsAnyOtherConstraint() {
+		// All mode plus any app-level constraint -> fall back to the PICS path.
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, Types = new HashSet<string> { "Game" } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, Categories = new HashSet<uint> { 1 } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, Tags = new HashSet<uint> { 19 } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, IgnoredAppIDs = new HashSet<uint> { 700 } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, IgnoredTags = new HashSet<uint> { 19 } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, IgnoredCategories = new HashSet<uint> { 1 } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, IgnoredContentDescriptors = new HashSet<uint> { 2 } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, ImportStoreFilters = true }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, IgnoreFreeWeekends = true }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, MinReviewScore = 80 }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, Languages = new HashSet<string> { "english" } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, NoCostOnly = true }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, Systems = new HashSet<string> { "linux" } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, WishlistOnly = true }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, MaxDaysOld = 30 }));
+	}
+
+	[TestMethod]
+	public void IsUnconstrainedAllPlaytestsFilterTreatsNonDemoIgnoredTypeAsConstraint() {
+		// The default {"Demo"} is allowed, but any other ignored type suppresses the
+		// proactive path, since the catalog can't tell whether it would reject a playtest.
+		Assert.IsTrue(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, IgnoredTypes = new HashSet<string> { "Demo" } }));
+		Assert.IsFalse(PackageFilter.IsUnconstrainedAllPlaytestsFilter(new FilterConfig { PlaytestMode = EPlaytestMode.All, IgnoredTypes = new HashSet<string> { "Beta" } }));
+	}
+
 	private static HashSet<uint> BuildSet(int count) {
 		HashSet<uint> set = new(count);
 

@@ -125,17 +125,23 @@ namespace FreePackages {
 		}
 
 		// Called by PlaytestCatalog after every successful, complete fetch. Prunes the
-		// suppression sets of every connected, ready bot against the new live set, then
-		// proactively enqueues any live playtest the bot hasn't already requested or
-		// waitlisted. This catches playtests PICS never surfaced (the original discovery
-		// gap) without re-requesting ones already handled this epoch.
+		// suppression sets and stale playtest packages of every connected, ready bot
+		// against the new live set, then proactively enqueues live playtests for bots
+		// whose filter accepts every playtest. This catches playtests PICS never
+		// surfaced (the original discovery gap) without re-requesting ones already
+		// handled this epoch, and without bypassing the user's filters.
 		//
-		// The proactive path intentionally does NOT apply the limited/unlimited
-		// PlaytestMode filter: the catalog only gives us BASE appIDs, and resolving each
-		// one's playtest_type would cost an extra PICS fetch per playtest. The PICS path
-		// (HandlePlaytest) still applies that filter for playtests it discovers. Missing
-		// a re-opening is worse than occasionally enqueuing a limited playtest a
-		// unlimited-only bot didn't strictly want.
+		// The proactive path runs only for a bot that has an "unconstrained all
+		// playtests" filter (PackageFilter.IsUnconstrainedAllPlaytestsFilter: PlaytestMode
+		// is All and no other app-level constraint is set). The catalog carries only BASE
+		// appIDs — no playtest_type, tags, review score, languages, etc. — so the
+		// proactive path can't honor limited/unlimited or any other filter; it is only
+		// safe to enqueue every live playtest when the filter would accept any playtest
+		// regardless. Bots with any finer filter (limited-only, a tag, an ignored app, a
+		// review floor, wishlist-only, an age cap, ...) are left to the PICS path
+		// (HandlePlaytest), which resolves the full app metadata and applies the filter
+		// before enqueueing. Pruning still runs for every bot so a playtest that re-opens
+		// later is re-requestable.
 		internal static void OnPlaytestCatalogUpdated(HashSet<uint> liveSet) {
 			ArgumentNullException.ThrowIfNull(liveSet);
 
@@ -157,8 +163,11 @@ namespace FreePackages {
 				// drain one-by-one as 401 Invalid. Live playtests stay queued and are claimed.
 				handler.BotCache.PrunePlaytestPackages(liveSet);
 
-				bool wantsPlaytests = handler.PackageFilter.FilterConfigs.Any(static filter => filter.PlaytestMode != EPlaytestMode.None);
-				if (!wantsPlaytests) {
+				// Only a bot whose filter accepts every playtest can be driven proactively
+				// from the catalog; the catalog carries no metadata to honor any finer filter,
+				// so a bot with a constrained filter is left to the PICS path instead.
+				bool allowProactive = handler.PackageFilter.FilterConfigs.Any(PackageFilter.IsUnconstrainedAllPlaytestsFilter);
+				if (!allowProactive) {
 					continue;
 				}
 
