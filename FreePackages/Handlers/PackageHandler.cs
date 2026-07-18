@@ -21,6 +21,12 @@ namespace FreePackages {
 		ConcurrentHashSet<Package> PackagesToRemove = new(new PackageComparer());
 		internal static ConcurrentDictionary<string, PackageHandler> Handlers = new();
 
+	// Set by PlaytestCatalog.DoUpdate for the duration of a fetch so every bot's
+	// ActivationQueue holds off claiming — the persisted queue is stale until the live set
+	// is refreshed, and claiming from it produces the 401 Invalid storm we're fixing.
+	// Volatile: written on the catalog timer thread, read on each queue's timer thread.
+	internal static volatile bool ActivationsPausedGlobally;
+
 		private readonly Timer UserDataRefreshTimer;
 		private static SemaphoreSlim AddHandlerSemaphore = new SemaphoreSlim(1, 1);
 		private static SemaphoreSlim ProcessChangesSemaphore = new SemaphoreSlim(1, 1);
@@ -100,6 +106,22 @@ namespace FreePackages {
 			handler.RemovalCancellation?.Cancel();
 		}
 
+		// Bracket a PlaytestCatalog fetch: while the flag is set, every ActivationQueue holds
+		// (see ActivationQueue.IsPaused) so the stale persisted queue doesn't fire 401s before
+		// the live set is refreshed. Resume nudges each queue so it re-checks immediately.
+		// Removals are intentionally NOT paused — they're unrelated to the playtest storm.
+		internal static void PauseAllActivations() {
+			ActivationsPausedGlobally = true;
+		}
+
+		internal static void ResumeAllActivations() {
+			ActivationsPausedGlobally = false;
+
+			foreach (PackageHandler handler in Handlers.Values) {
+				handler.ActivationQueue.Nudge();
+			}
+		}
+
 		// Called by PlaytestCatalog after every successful, complete fetch. Prunes the
 		// suppression sets of every connected, ready bot against the new live set, then
 		// proactively enqueues any live playtest the bot hasn't already requested or
@@ -127,6 +149,11 @@ namespace FreePackages {
 				}
 
 				handler.BotCache.PrunePlaytests(liveSet);
+
+				// Drop now-closed playtests from the activation queue too, so the stale
+				// persisted entries (from before the gate existed, or from the PICS path) don't
+				// drain one-by-one as 401 Invalid. Live playtests stay queued and are claimed.
+				handler.BotCache.PrunePlaytestPackages(liveSet);
 
 				bool wantsPlaytests = handler.PackageFilter.FilterConfigs.Any(static filter => filter.PlaytestMode != EPlaytestMode.None);
 				if (!wantsPlaytests) {

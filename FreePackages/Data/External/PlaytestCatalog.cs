@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -23,11 +24,45 @@ using ArchiSteamFarm.Web.Responses;
 
 namespace FreePackages {
 	internal static class PlaytestCatalog {
-		private const int PageSize = 50;
-		private const int MaxPages = 200; // 200 * 50 = 10,000 — a safety bound well above the ~2,800 observed
-		private static readonly TimeSpan InitialDelay = TimeSpan.FromMinutes(15);
+		// Steam's search endpoint caps `count` at 100 per request (verified 2026-07-18:
+		// count=200 returns the same 100 entries as count=100). 100/page is the most we can
+		// get, so a full ~3,005-playtest fetch is 31 pages — and Steam's anonymous-search
+		// burst limit is a HARD ~30-request cap (count-based, not rate-based: spacing
+		// 0s and 1s both die on exactly the 31st request). So the 31st/final page trips the
+		// limit; we ride it out with PageRetryBackoff instead of aborting the whole fetch.
+		private const int PageSize = 100;
+		private const int MaxPages = 200; // 200 * 100 = 20,000 — a safety bound well above the ~3,000 observed
+		// Run the first fetch almost immediately at startup (not after 15 min): until the live
+		// set is populated HasFetched stays false, the gate falls back to PICS-only, and the
+		// persisted queue rains 401 Invalid. A few seconds lets ASF.WebBrowser settle, then we
+		// fetch. Activations are paused for the duration of the fetch so even that window is dry.
+		private static readonly TimeSpan InitialDelay = TimeSpan.FromSeconds(5);
 		private static readonly TimeSpan RefreshFrequency = TimeSpan.FromMinutes(15);
-		private static readonly TimeSpan EarlyWakeDebounce = TimeSpan.FromSeconds(60);
+		// Early-wake debounce. PICS fires Beta-app changes in bursts, and each wake re-fetches
+		// the WHOLE catalog (all ~31 pages). A 60s debounce turned PICS storms into a full
+		// re-fetch every minute, which both wasted requests and pushed us into Steam's
+		// anonymous-search rate limit. 5 min bounds re-fetches during a storm while still
+		// catching a re-opening well ahead of the 15-min periodic cycle.
+		private static readonly TimeSpan EarlyWakeDebounce = TimeSpan.FromMinutes(5);
+		// Pace the paginated fetch. The burst limit is count-based (~30 requests) so pacing
+		// alone can't avoid it once we exceed 30 pages, but a small delay keeps the request
+		// stream smooth and lets a transient -1 self-recover before we burn a retry slot.
+		private static readonly TimeSpan InterPageDelay = TimeSpan.FromSeconds(1);
+		// Back off and retry the SAME page when Steam rate-limits us (HTTP -1), instead of
+		// aborting the whole fetch at page 30. The cooldown looks like a ~5-min rolling
+		// window, so a few 120s retries give it time to clear and let the final page through.
+		// Worst case (all retries exhausted) we give up, resume activations, and try again
+		// next cycle — the live set stays stale but the queue is never held forever.
+		private const int MaxPageRetries = 4;
+		private static readonly TimeSpan PageRetryBackoff = TimeSpan.FromSeconds(120);
+		// Per-request timeout. A hung Steam GET used to hold RefreshSemaphore forever, which
+		// made every later DoUpdate return silently (no log at all) — indistinguishable from
+		// "the catalog never runs". Bailing after this keeps the timer honest.
+		private static readonly TimeSpan PerRequestTimeout = TimeSpan.FromSeconds(30);
+		// How many pages between progress reports. The fetch is long enough (~60s+) that
+		// reporting collected count + ETA every N pages is useful telemetry, and the reports
+		// also prove the fetch is actually advancing (vs. silently stuck).
+		private const int ProgressReportEvery = 10;
 
 		// data-ds-appid on each search result is the BASE game appID — the same value the
 		// plugin posts to /ajaxrequestplaytestaccess/<id> and stores as app.Parent.ID.
@@ -35,7 +70,12 @@ namespace FreePackages {
 
 		// The URL form verified on 2026-07-17: anonymous, paginated via start=, count=,
 		// category1=989 (Playtests). `infinite=1&json=1` returns {success,total_count,results_html}.
-		private const string SearchUrl = "https://store.steampowered.com/search/results/?query&start={0}&count={1}&dynamic_data=&sort_by=_ASC&snr=1_7_7_230_150&category1=989&infinite=1&json=1";
+		// sort_by MUST be a real deterministic field (Name_ASC). The earlier `sort_by=_ASC`
+		// (empty field) made Steam fall back to a non-deterministic order, so paginating by
+		// `start` returned overlapping slices — a full fetch collected only ~74% of total_count
+		// with unique-per-page declining across the run. Name_ASC partitions cleanly: 100/page,
+		// zero overlap between start=0 and start=100 (verified 2026-07-18).
+		private const string SearchUrl = "https://store.steampowered.com/search/results/?query&start={0}&count={1}&dynamic_data=&sort_by=Name_ASC&snr=1_7_7_230_150&category1=989&infinite=1&json=1";
 
 		private static HashSet<uint> LivePlaytests = new();
 		private static readonly object LiveLock = new();
@@ -46,6 +86,8 @@ namespace FreePackages {
 		private static readonly Timer UpdateTimer = new(async _ => await DoUpdate().ConfigureAwait(false), null, Timeout.Infinite, Timeout.Infinite);
 
 		internal static void Update() {
+			ASF.ArchiLogger.LogGenericInfo($"PlaytestCatalog.Update() called — arming timer (first fetch in {InitialDelay.TotalSeconds:F0}s, then every {RefreshFrequency.TotalMinutes:F0}m)");
+
 			UpdateTimer.Change(InitialDelay, RefreshFrequency);
 		}
 
@@ -116,67 +158,135 @@ namespace FreePackages {
 		}
 
 		private static async Task DoUpdate() {
-			ArgumentNullException.ThrowIfNull(ASF.WebBrowser);
-
-			// Skip overlapping invocations (scheduled tick + early wake): the run already
-			// in progress covers the latest state, so a queued second run adds nothing.
-			if (!await RefreshSemaphore.WaitAsync(0).ConfigureAwait(false)) {
-				return;
-			}
-
 			HashSet<uint> fetched = new();
 			int totalCount = 0;
+			int totalPages = 0;
 			bool failed = false;
+			Stopwatch stopwatch = Stopwatch.StartNew();
 
 			try {
-				for (int page = 0; page < MaxPages; page++) {
-					int start = page * PageSize;
+				ArgumentNullException.ThrowIfNull(ASF.WebBrowser);
 
-					if (page > 0 && start >= totalCount) {
-						break;
-					}
+				// Acquire the semaphore exactly ONCE. SemaphoreSlim is non-reentrant: a second
+				// WaitAsync(0) from the same caller while it already holds the slot returns
+				// false. An earlier version of this method had a duplicate acquisition (left over
+				// from wrapping the body in an outer try/catch) — the second WaitAsync(0)
+				// returned false, the method returned here, the inner finally that releases the
+				// semaphore never ran, the slot was leaked, and every later DoUpdate silently
+				// bailed at this same check. Net effect: zero catalog logs, no activation pause,
+				// and the persisted queue drained as the 401 storm we were trying to fix.
+				if (!await RefreshSemaphore.WaitAsync(0).ConfigureAwait(false)) {
+					return;
+				}
 
-					Uri request = new(string.Format(SearchUrl, start, PageSize));
-					ObjectResponse<SearchResults>? response = await ASF.WebBrowser.UrlGetToJsonObject<SearchResults>(request).ConfigureAwait(false);
+				// Hold all activations for the duration of the fetch: the persisted queue is
+				// stale until the live set is refreshed, and claiming from it is the 401 storm.
+				// The log is inside the inner try so the inner finally (Resume) is guaranteed to
+				// run once we've paused, even if the log line itself ever throws.
+				PackageHandler.PauseAllActivations();
 
-					HashSet<uint>? pageAppIDs = ParsePage(response?.Content);
-					if (pageAppIDs == null) {
-						int statusCode = response == null ? -1 : (int) response.StatusCode;
-						ASF.ArchiLogger.LogGenericError($"PlaytestCatalog fetch failed at page {page} (start={start}, HTTP {statusCode})");
+				try {
+					ASF.ArchiLogger.LogGenericInfo("PlaytestCatalog fetch beginning — activations paused");
 
-						failed = true;
-						break;
-					}
+					int start = 0;
+					for (int page = 0; page < MaxPages && !failed; page++) {
+						// We know the list length only after the first page; once we do, stop
+						// before walking past it (the last page returns a partial result set).
+						if (page > 0) {
+							if (totalCount > 0 && start >= totalCount) {
+								break;
+							}
 
-					if (page == 0) {
-						totalCount = response!.Content!.TotalCount;
+							await Task.Delay(InterPageDelay).ConfigureAwait(false);
+						}
 
-						if (totalCount <= 0) {
-							ASF.ArchiLogger.LogGenericError("PlaytestCatalog fetch failed: total_count was 0");
+						Uri request = new(string.Format(SearchUrl, start, PageSize));
+						ObjectResponse<SearchResults>? response = null;
+						HashSet<uint>? pageAppIDs = null;
+
+						// Retry the SAME page on a rate-limit/timeout instead of aborting the whole
+						// fetch. The anonymous-search burst cap (~30 requests) means the final
+						// page of a full fetch will be rejected once; backing off lets the rolling
+						// window clear so that page comes through and the fetch completes.
+						for (int attempt = 0; attempt <= MaxPageRetries && pageAppIDs == null; attempt++) {
+							if (attempt > 0) {
+								ASF.ArchiLogger.LogGenericWarning($"PlaytestCatalog rate-limited at page {page} (start={start}); backing off {PageRetryBackoff.TotalSeconds:F0}s (retry {attempt}/{MaxPageRetries})");
+								await Task.Delay(PageRetryBackoff).ConfigureAwait(false);
+							}
+
+							Task<ObjectResponse<SearchResults>?> getTask = ASF.WebBrowser.UrlGetToJsonObject<SearchResults>(request);
+							Task delayTask = Task.Delay(PerRequestTimeout);
+
+							// Don't let a single hung Steam GET hold RefreshSemaphore forever — that
+							// would silently skip every later DoUpdate and produce no logs at all.
+							if (await Task.WhenAny(getTask, delayTask).ConfigureAwait(false) == delayTask) {
+								ASF.ArchiLogger.LogGenericError($"PlaytestCatalog fetch timed out at page {page} (start={start}) after {PerRequestTimeout.TotalSeconds:F0}s");
+
+								continue;
+							}
+
+							response = await getTask.ConfigureAwait(false);
+							pageAppIDs = ParsePage(response?.Content);
+
+							if (pageAppIDs == null) {
+								int statusCode = response == null ? -1 : (int) response.StatusCode;
+								ASF.ArchiLogger.LogGenericWarning($"PlaytestCatalog got HTTP {statusCode} at page {page} (start={start})");
+							}
+						}
+
+						if (pageAppIDs == null) {
+							ASF.ArchiLogger.LogGenericError($"PlaytestCatalog fetch failed at page {page} (start={start}) after {MaxPageRetries + 1} attempt(s) — giving up");
 
 							failed = true;
 							break;
 						}
-					}
 
-					int before = fetched.Count;
-					fetched.UnionWith(pageAppIDs);
+						if (page == 0) {
+							totalCount = response!.Content!.TotalCount;
 
-					// No new entries on a page means we've walked past the end of the list.
-					if (fetched.Count == before) {
-						break;
-					}
+							if (totalCount <= 0) {
+								ASF.ArchiLogger.LogGenericError("PlaytestCatalog fetch failed: total_count was 0");
 
-					if (start + PageSize >= totalCount) {
-						break;
+								failed = true;
+								break;
+							}
+
+							totalPages = (totalCount + PageSize - 1) / PageSize;
+							ASF.ArchiLogger.LogGenericInfo($"PlaytestCatalog fetch started: total_count={totalCount} across {totalPages} page(s)");
+						}
+
+						int before = fetched.Count;
+						fetched.UnionWith(pageAppIDs);
+
+						// Advance by the ACTUAL yield, not PageSize: Steam caps count at 100
+						// regardless of what we request, and the last page returns fewer. Walking
+						// by what we actually got means we never skip entries even if count were
+						// silently clamped, and we stop cleanly when a page comes back empty.
+						start += pageAppIDs.Count;
+
+						// No new entries, or an empty page, means we've walked past the end.
+						if (pageAppIDs.Count == 0 || fetched.Count == before) {
+							break;
+						}
+
+						if ((page + 1) % ProgressReportEvery == 0) {
+							double elapsedS = stopwatch.Elapsed.TotalSeconds;
+							double avgPerPage = elapsedS / (page + 1);
+							int remainingPages = Math.Max(0, totalPages - (page + 1));
+							double etaS = remainingPages * avgPerPage;
+
+							ASF.ArchiLogger.LogGenericInfo($"PlaytestCatalog fetch progress: page {page + 1}/{totalPages} — {fetched.Count} appID(s) collected, {elapsedS:F0}s elapsed, ~{etaS:F0}s remaining");
+						}
 					}
+				} finally {
+					RefreshSemaphore.Release();
+					PackageHandler.ResumeAllActivations();
+					ASF.ArchiLogger.LogGenericInfo("PlaytestCatalog fetch finished — activations resumed");
 				}
 			} catch (Exception e) {
 				ASF.ArchiLogger.LogGenericException(e);
 
 				failed = true;
-			} finally {
-				RefreshSemaphore.Release();
 			}
 
 			// A failed or incomplete fetch keeps the previous live set and MUST NOT prune.
@@ -199,7 +309,7 @@ namespace FreePackages {
 				snapshot = new HashSet<uint>(fetched);
 			}
 
-			ASF.ArchiLogger.LogGenericInfo($"PlaytestCatalog fetched {snapshot.Count} live playtest(s) (total_count={totalCount})");
+			ASF.ArchiLogger.LogGenericInfo($"PlaytestCatalog fetched {snapshot.Count} live playtest(s) across {totalPages} page(s) in {stopwatch.Elapsed.TotalSeconds:F0}s (total_count={totalCount})");
 
 			// Fan out the prune + proactive enqueue off the timer thread.
 			Utilities.InBackground(() => PackageHandler.OnPlaytestCatalogUpdated(snapshot));

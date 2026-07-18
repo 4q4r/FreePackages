@@ -313,6 +313,30 @@ namespace FreePackages {
 			ScheduleSave();
 		}
 
+		// Remove playtest packages from the activation queue that are no longer in the live
+		// catalog. Without this, a playtest that was enqueued (pre-gate, or via the PICS path)
+		// and then closed would sit in the persisted queue and produce a 401 Invalid when it
+		// is finally claimed — one per stale entry, draining slowly under the activation
+		// rate limit. Pruning them here — only on a successful complete fetch, like
+		// PrunePlaytests — makes that cleanup instant and silent. Live playtests stay in the
+		// queue and are claimed normally (OK/Waitlisted). A playtest that re-opens later
+		// re-enters the catalog, is pruned out of RequestedPlaytests on the cycle it was
+		// absent, and is re-enqueued by OnPlaytestCatalogUpdated on the cycle it returns.
+		internal void PrunePlaytestPackages(HashSet<uint> liveSet) {
+			ArgumentNullException.ThrowIfNull(liveSet);
+
+			List<Package> stale = Packages.Where(x => x.Type == EPackageType.Playtest && !liveSet.Contains(x.ID)).ToList();
+			if (stale.Count == 0) {
+				return;
+			}
+
+			foreach (Package package in stale) {
+				Packages.Remove(package);
+			}
+
+			ScheduleSave();
+		}
+
 		internal void UpdateSeenPackages(List<SteamApps.LicenseListCallback.License> newLicenses) {
 			SeenPackages.UnionWith(newLicenses.Select(license => license.PackageID));
 

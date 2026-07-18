@@ -16,6 +16,12 @@ namespace FreePackages {
 		private PackageFilter PackageFilter => PackageHandler.Handlers[Bot.BotName].PackageFilter;
 		private Timer Timer;
 
+		// Overridden by ActivationQueue to honor PackageHandler.ActivationsPausedGlobally —
+		// while a PlaytestCatalog fetch is in progress we hold all activations so the
+		// stale persisted queue doesn't fire a 401 storm before the live set is refreshed.
+		// RemovalQueue inherits the default (never paused).
+		protected virtual bool IsPaused => false;
+
 		internal PackageQueue(Bot bot, BotCache botCache, bool pauseWhilePlaying, bool pauseWhileFarming) {
 			Bot = bot;
 			BotCache = botCache;
@@ -33,6 +39,15 @@ namespace FreePackages {
 		}
 
 		private async Task ProcessQueue() {
+			// Hold activations while the PlaytestCatalog fetch is running (see IsPaused). Re-check
+			// shortly so we resume promptly once the fetch finishes and PackageHandler clears
+			// the flag (ResumeAllActivations also nudges the timer for an immediate re-check).
+			if (IsPaused) {
+				UpdateTimer(DateTime.Now.AddSeconds(5));
+
+				return;
+			}
+
 			if (!Bot.IsConnectedAndLoggedOn || !PackageFilter.Ready) {
 				UpdateTimer(DateTime.Now.AddMinutes(1));
 
@@ -309,5 +324,9 @@ namespace FreePackages {
 
 		private static int GetMillisecondsFromNow(DateTime then) => Math.Max(0, (int)(then - DateTime.Now).TotalMilliseconds);
 		private void UpdateTimer(DateTime then) => Timer?.Change(GetMillisecondsFromNow(then), Timeout.Infinite);
+
+		// Fire the queue tick immediately (used by ResumeAllActivations so activation queues
+		// resume right after a fetch instead of waiting up to their scheduled delay).
+		internal void Nudge() => Timer?.Change(0, Timeout.Infinite);
 	}
 }

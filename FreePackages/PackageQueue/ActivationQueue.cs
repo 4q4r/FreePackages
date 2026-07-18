@@ -26,6 +26,10 @@ namespace FreePackages {
 
 		protected override Package? GetNextPackage() => BotCache.GetNextPackage(ActivationTypes);
 
+		// Held while a PlaytestCatalog fetch is running so we don't burn 401s from the stale
+		// persisted queue before the live set is refreshed. See PackageQueue.IsPaused.
+		protected override bool IsPaused => PackageHandler.ActivationsPausedGlobally;
+
 		protected override async Task<DateTime?> BeforeProcessing(Package package) {
 			// Rate limit reached
 			if (BotCache.NumActivationsPastPeriod() >= ActivationsPerPeriod) {
