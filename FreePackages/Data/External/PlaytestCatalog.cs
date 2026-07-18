@@ -32,22 +32,35 @@ namespace FreePackages {
 		// limit; we ride it out with PageRetryBackoff instead of aborting the whole fetch.
 		private const int PageSize = 100;
 		private const int MaxPages = 200; // 200 * 100 = 20,000 — a safety bound well above the ~3,000 observed
-		// Run the first fetch almost immediately at startup (not after 15 min): until the live
-		// set is populated HasFetched stays false, the gate falls back to PICS-only, and the
-		// persisted queue rains 401 Invalid. A few seconds lets ASF.WebBrowser settle, then we
-		// fetch. Activations are paused for the duration of the fetch so even that window is dry.
+		// Run the first fetch almost immediately at startup (not after the full interval): until
+		// the live set is populated HasFetched stays false, the gate falls back to PICS-only, and
+		// the persisted queue rains 401 Invalid. A few seconds lets ASF.WebBrowser settle, then
+		// we fetch. PLAYTEST activations are paused for the duration of the fetch so even that
+		// window is dry; apps/subs keep going.
 		private static readonly TimeSpan InitialDelay = TimeSpan.FromSeconds(5);
-		private static readonly TimeSpan RefreshFrequency = TimeSpan.FromMinutes(15);
+		// Fetch the catalog once per hour. Each fetch is ~31 paginated GETs, and a playtest can
+		// only re-open a handful of times over a weekend, so an hourly cadence keeps our request
+		// volume low for a negligible increase in the chance we miss a briefly-open window.
+		private static readonly TimeSpan RefreshFrequency = TimeSpan.FromMinutes(60);
 		// Early-wake debounce. PICS fires Beta-app changes in bursts, and each wake re-fetches
-		// the WHOLE catalog (all ~31 pages). A 60s debounce turned PICS storms into a full
-		// re-fetch every minute, which both wasted requests and pushed us into Steam's
-		// anonymous-search rate limit. 5 min bounds re-fetches during a storm while still
-		// catching a re-opening well ahead of the 15-min periodic cycle.
-		private static readonly TimeSpan EarlyWakeDebounce = TimeSpan.FromMinutes(5);
-		// Pace the paginated fetch. The burst limit is count-based (~30 requests) so pacing
-		// alone can't avoid it once we exceed 30 pages, but a small delay keeps the request
-		// stream smooth and lets a transient -1 self-recover before we burn a retry slot.
-		private static readonly TimeSpan InterPageDelay = TimeSpan.FromSeconds(1);
+		// the WHOLE catalog (all ~31 pages). Bounding this to the same hourly cadence keeps PICS
+		// storms from turning into a re-fetch every few minutes, which both wasted requests and
+		// pushed us into Steam's anonymous-search rate limit. A re-opening is still caught within
+		// an hour — the same window the periodic cycle already targets.
+		private static readonly TimeSpan EarlyWakeDebounce = TimeSpan.FromMinutes(60);
+		// Pace the paginated fetch. Steam's anonymous-search burst limit is a HARD ~30-request
+		// cap inside a ~5-minute (300s) SLIDING window (count-based, not rate-based: spacing 0s
+		// and 1s both die on exactly the 31st request). The window slides, so what matters is
+		// request DENSITY inside any 300s span, not the total fetch duration: "spread the fetch
+		// past 5 minutes" does NOT help on its own, since a sliding window still catches every
+		// request that lands within 300s of another.
+		//
+		// At S seconds spacing, any 300s sliding window holds at most floor(300/S)+1 requests,
+		// so S=25 => ~12 requests/window = 40% of the 30-cap, leaving headroom for other
+		// anonymous store-search calls. A full 31-page fetch then takes 31 * 25s ~ 13 min, well
+		// inside the hourly cadence (RefreshFrequency below). The backoff stays as a safety net
+		// in case the real window is longer than observed.
+		private static readonly TimeSpan InterPageDelay = TimeSpan.FromSeconds(25);
 		// Back off and retry the SAME page when Steam rate-limits us (HTTP -1), instead of
 		// aborting the whole fetch at page 30. The cooldown looks like a ~5-min rolling
 		// window, so a few 120s retries give it time to clear and let the final page through.
@@ -91,8 +104,9 @@ namespace FreePackages {
 			UpdateTimer.Change(InitialDelay, RefreshFrequency);
 		}
 
-		// Wake the catalog immediately (debounced to ~60s) so a Beta-app PICS change is
-		// reflected within a minute instead of waiting up to 15 minutes for the next cycle.
+		// Wake the catalog immediately (debounced to the hourly cadence) so a Beta-app PICS
+		// change can be reflected sooner than the next periodic cycle instead of waiting up
+		// to an hour. The debounce keeps PICS storms from re-fetching every few minutes.
 		internal static void RequestRefresh() {
 			long now = DateTime.UtcNow.Ticks;
 			long last = Interlocked.Read(ref LastRefreshRequestTicks);
@@ -179,14 +193,15 @@ namespace FreePackages {
 					return;
 				}
 
-				// Hold all activations for the duration of the fetch: the persisted queue is
-				// stale until the live set is refreshed, and claiming from it is the 401 storm.
-				// The log is inside the inner try so the inner finally (Resume) is guaranteed to
-				// run once we've paused, even if the log line itself ever throws.
-				PackageHandler.PauseAllActivations();
+				// Hold PLAYTEST activations for the duration of the fetch: the persisted playtest
+				// queue is stale until the live set is refreshed, and claiming from it is the 401
+				// storm. Apps/subs keep activating normally. The log is inside the inner try so the
+				// inner finally (Resume) is guaranteed to run once we've paused, even if the log
+				// line itself ever throws.
+				PackageHandler.PausePlaytestActivations();
 
 				try {
-					ASF.ArchiLogger.LogGenericInfo("PlaytestCatalog fetch beginning — activations paused");
+					ASF.ArchiLogger.LogGenericInfo("PlaytestCatalog fetch beginning — playtest activations paused");
 
 					int start = 0;
 					for (int page = 0; page < MaxPages && !failed; page++) {
@@ -280,8 +295,8 @@ namespace FreePackages {
 					}
 				} finally {
 					RefreshSemaphore.Release();
-					PackageHandler.ResumeAllActivations();
-					ASF.ArchiLogger.LogGenericInfo("PlaytestCatalog fetch finished — activations resumed");
+					PackageHandler.ResumePlaytestActivations();
+					ASF.ArchiLogger.LogGenericInfo("PlaytestCatalog fetch finished — playtest activations resumed");
 				}
 			} catch (Exception e) {
 				ASF.ArchiLogger.LogGenericException(e);

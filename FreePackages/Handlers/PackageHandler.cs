@@ -22,10 +22,11 @@ namespace FreePackages {
 		internal static ConcurrentDictionary<string, PackageHandler> Handlers = new();
 
 	// Set by PlaytestCatalog.DoUpdate for the duration of a fetch so every bot's
-	// ActivationQueue holds off claiming — the persisted queue is stale until the live set
-	// is refreshed, and claiming from it produces the 401 Invalid storm we're fixing.
-	// Volatile: written on the catalog timer thread, read on each queue's timer thread.
-	internal static volatile bool ActivationsPausedGlobally;
+	// ActivationQueue skips PLAYTEST claims only (apps/subs keep going) — the persisted
+	// playtest queue is stale until the live set is refreshed, and claiming from it
+	// produces the 401 Invalid storm we're fixing. Volatile: written on the catalog
+	// timer thread, read on each queue's timer thread.
+	internal static volatile bool PlaytestsPausedGlobally;
 
 		private readonly Timer UserDataRefreshTimer;
 		private static SemaphoreSlim AddHandlerSemaphore = new SemaphoreSlim(1, 1);
@@ -106,16 +107,17 @@ namespace FreePackages {
 			handler.RemovalCancellation?.Cancel();
 		}
 
-		// Bracket a PlaytestCatalog fetch: while the flag is set, every ActivationQueue holds
-		// (see ActivationQueue.IsPaused) so the stale persisted queue doesn't fire 401s before
-		// the live set is refreshed. Resume nudges each queue so it re-checks immediately.
-		// Removals are intentionally NOT paused — they're unrelated to the playtest storm.
-		internal static void PauseAllActivations() {
-			ActivationsPausedGlobally = true;
+		// Bracket a PlaytestCatalog fetch: while the flag is set, every ActivationQueue skips
+		// PLAYTEST packages only (see ActivationQueue.GetNextPackage) so the stale persisted
+		// playtest queue doesn't fire 401s before the live set is refreshed — apps/subs keep
+		// activating normally. Resume nudges each queue so it re-checks immediately.
+		// Removals are never paused — they're unrelated to the playtest storm.
+		internal static void PausePlaytestActivations() {
+			PlaytestsPausedGlobally = true;
 		}
 
-		internal static void ResumeAllActivations() {
-			ActivationsPausedGlobally = false;
+		internal static void ResumePlaytestActivations() {
+			PlaytestsPausedGlobally = false;
 
 			foreach (PackageHandler handler in Handlers.Values) {
 				handler.ActivationQueue.Nudge();
